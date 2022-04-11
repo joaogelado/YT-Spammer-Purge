@@ -305,6 +305,8 @@ def check_spam_threads(current, filtersDict, miscData, config, parentCommentDict
     add_spam(current, config, miscData, parentCommentDict, parentCommentDict['videoID'], matchReason="Spam Bot Thread")
     return current
   # Preliminary Analysis
+  if not threadDict:
+    return current
   matchCount = threadWordsRegex.findall(parentCommentDict['commentText'].lower())
   if matchCount:
       preliminaryCount += len(matchCount)
@@ -827,6 +829,7 @@ def check_against_filter(current, filtersDict, miscData, config, currentCommentD
       compiledNumRegex = smartFilter['compiledNumRegex']
       compiledAllNumRegex = smartFilter['compiledAllNumRegex']
       phoneRegexCompiled = smartFilter['phoneRegexCompiled']
+      bigNumCheckRegexCompiled = smartFilter['bigNumCheckRegexCompiled']
       minNumbersMatchCount = smartFilter['minNumbersMatchCount']
       bufferChars = compiledRegexDict['bufferChars']
       #usernameBlackCharsSet = smartFilter['usernameBlackCharsSet']
@@ -850,7 +853,7 @@ def check_against_filter(current, filtersDict, miscData, config, currentCommentD
         rootDomainRegex = smartFilter['sensitiveRootDomainRegex']
 
       # Functions --------------------------------------------------------------
-      def findObf(expression, chars, stringToSearch, findall=True):
+      def findObf(expression, chars, stringToSearch, findall=True, phone=False):
         # Confusable thinks s and f look similar, have to compensate to avoid false positive
         ignoredConfusablesConverter = {ord('f'):ord('s'),ord('s'):ord('f')}
         if findall:
@@ -862,17 +865,18 @@ def check_against_filter(current, filtersDict, miscData, config, currentCommentD
         else:
           for match in result:
             if match != '':
-              lowerChars = chars.lower()
-              # Strips off buffer characters and specified unicode categories
-              while match[0] in compiledRegexDict['bufferChars'] or match[-1] in compiledRegexDict['bufferChars']:
-                for bufferChar in compiledRegexDict['bufferChars']:
-                  match = match.strip(bufferChar)
-              while unicodedata.category(match[0]) in smartFilter['unicodeCategoriesStrip']:
-                match = match[1:]
-              while unicodedata.category(match[-1]) in smartFilter['unicodeCategoriesStrip']:
-                match = match[:-1]
-              if any(char not in lowerChars for char in match) and any(char not in lowerChars.translate(ignoredConfusablesConverter) for char in match):
-                return True
+              if not phone or (phone and not bigNumCheckRegexCompiled.search(match)):
+                lowerChars = chars.lower()
+                # Strips off buffer characters and specified unicode categories
+                while match[0] in compiledRegexDict['bufferChars'] or match[-1] in compiledRegexDict['bufferChars']:
+                  for bufferChar in compiledRegexDict['bufferChars']:
+                    match = match.strip(bufferChar)
+                while unicodedata.category(match[0]) in smartFilter['unicodeCategoriesStrip']:
+                  match = match[1:]
+                while unicodedata.category(match[-1]) in smartFilter['unicodeCategoriesStrip']:
+                  match = match[:-1]
+                if any(char not in lowerChars for char in match) and any(char not in lowerChars.translate(ignoredConfusablesConverter) for char in match):
+                  return True
 
       def remove_unicode_categories(string):
         return "".join(char for char in string if unicodedata.category(char) not in smartFilter['unicodeCategoriesStrip'])
@@ -914,7 +918,9 @@ def check_against_filter(current, filtersDict, miscData, config, currentCommentD
         pass
       elif len(compiledAllNumRegex.findall(combinedString)) >= minNumbersMatchCount:
         add_spam(current, config, miscData, currentCommentDict, videoID)
-      elif findObf(phoneRegexCompiled, '0123456789+-() ', combinedString):
+      elif sensitive and findObf(phoneRegexCompiled, '0123456789+-() ', combinedString, phone=True):
+        add_spam(current, config, miscData, currentCommentDict, videoID)
+      elif not sensitive and compiledRegexDict['doubledSusWords'].search(combinedStringNormalized) and findObf(phoneRegexCompiled, '0123456789+-() ', combinedString, phone=True):
         add_spam(current, config, miscData, currentCommentDict, videoID)
       elif compiledNumRegex.search(combinedString):
         add_spam(current, config, miscData, currentCommentDict, videoID)
@@ -1128,7 +1134,7 @@ def check_deleted_comments(commentInput):
         results = auth.YOUTUBE.comments().list(
           part="snippet",
           id=commentID,  
-          maxResults=1,
+          #maxResults=1, #Cannot be used with 'id' parameter
           fields="items",
           textFormat="plainText"
         ).execute()
@@ -1146,7 +1152,17 @@ def check_deleted_comments(commentInput):
         elif type(commentInput) == list:
           print("Possible Issue Deleting Comment: " + str(commentID))
         i += 1
-        unsuccessfulResults.append(results)
+        pass
+      except HttpError as hx:
+        try:
+          reason = str(hx.error_details[0]["reason"])
+        except:
+          reason = "Not Given"
+        if type(commentInput) == dict:
+          print(f"HttpError '{reason}' While Deleting Comment: " + str(commentID) + " |  Check Here: " + "https://www.youtube.com/watch?v=" + str(commentInput[commentID]['videoID']) + "&lc=" + str(commentID))
+        elif type(commentInput) == list:
+          print(f"HttpError '{reason}' While Deleting Comment: " + str(commentID))
+        i += 1
         pass
       except Exception:
         if type(commentInput) == dict:
@@ -1154,19 +1170,12 @@ def check_deleted_comments(commentInput):
         elif type(commentInput) == list:
           print("Unhandled Exception While Deleting Comment: " + str(commentID))
         i += 1
-        unsuccessfulResults.append(results)
         pass
 
     if i == 0:
       print("\n\nSuccess: All comments should be gone.")
     elif i > 0:
       print("\n\nWarning: " + str(i) + " comments may remain. Check links above or try running the program again. An error log file has been created: 'Deletion_Error_Log.txt'")
-      # Write error log
-      with open("Deletion_Error_Log.txt", "a", encoding="utf-8") as f:
-        f.write("----- YT Spammer Purge Error Log: Possible Issue Deleting Comments ------\n\n")
-        f.write(str(unsuccessfulResults))
-        f.write("\n\n")
-        f.close()
     else:
       print("\n\nSomething strange happened... The comments may or may have not been deleted.")
 
@@ -1187,7 +1196,7 @@ def check_recovered_comments(commentsList):
       results = auth.YOUTUBE.comments().list(
         part="snippet",
         id=comment,  
-        maxResults=1,
+        #maxResults=1, # Cannot be used with 'id' parameter
         fields="items",
         textFormat="plainText"
       ).execute()
